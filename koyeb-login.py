@@ -23,7 +23,8 @@ def send_telegram_message(message: str) -> None:
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = json.dumps(
-        {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+        {"chat_id": chat_id, "text": message},
+        ensure_ascii=False,
     ).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -34,6 +35,9 @@ def send_telegram_message(message: str) -> None:
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             print(f"Telegram 发送完成: HTTP {resp.status}")
+    except urllib.error.HTTPError as exc:
+        err = exc.read().decode("utf-8", errors="replace")
+        print(f"发送消息失败: HTTP {exc.code} - {err[:300]}")
     except Exception as exc:  # noqa: BLE001
         print(f"发送消息失败: {exc}")
 
@@ -207,7 +211,7 @@ def main() -> int:
         if not ok:
             failed += 1
 
-    report = "*Koyeb API 保活任务报告*:\n\n" + "\n".join(results)
+    report = "Koyeb API 保活任务报告:\n\n" + "\n".join(results)
     send_telegram_message(report)
 
     if failed:
