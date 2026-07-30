@@ -1,99 +1,159 @@
-from playwright.sync_api import sync_playwright
-import os
-import requests
-import time
+#!/usr/bin/env python3
+"""Koyeb 账号保活：通过 API Token 调用账号接口，替代已失效的浏览器登录。"""
 
-def send_telegram_message(message):
-    bot_token = os.environ.get('TEL_TOK')
-    chat_id = os.environ.get('TEL_ID')
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+API_PROFILE = "https://app.koyeb.com/v1/account/profile"
+API_ORG = "https://app.koyeb.com/v1/account/organization"
+REQUEST_TIMEOUT = 30
+
+
+def send_telegram_message(message: str) -> None:
+    bot_token = os.environ.get("TEL_TOK")
+    chat_id = os.environ.get("TEL_ID")
     if not bot_token or not chat_id:
         print("Telegram 配置缺失，跳过发送消息")
         return
+
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
+    payload = json.dumps(
+        {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     try:
-        response = requests.post(url, json=payload)
-        return response.json()
-    except Exception as e:
-        print(f"发送消息失败: {e}")
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            print(f"Telegram 发送完成: HTTP {resp.status}")
+            print(body[:300])
+    except Exception as exc:  # noqa: BLE001
+        print(f"发送消息失败: {exc}")
 
-def login_koyeb(email, password):
-    with sync_playwright() as p:
-        # 启动浏览器，设置模拟窗口大小
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(viewport={'width': 1280, 'height': 800})
-        page = context.new_page()
-        
-        # 预设截图文件名（处理特殊字符以防报错）
-        safe_email = email.replace('@', '_').replace('.', '_')
-        screenshot_path = f"error_{safe_email}.png"
 
+def api_get(url: str, token: str) -> tuple[int, dict | str]:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "koyeb-login-keepalive/2.0",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            try:
+                return resp.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return resp.status, raw
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
         try:
-            # 1. 访问登录页面
-            page.goto("https://app.koyeb.com/auth/signin", wait_until="networkidle")
-            
-            # 2. 填写邮箱并点击继续
-            page.wait_for_selector('input[name="email"]', timeout=15000)
-            page.fill('input[name="email"]', email)
-            page.click('button[type="submit"]')
-            print(f"[{email}] 第一步：邮箱已提交")
+            return exc.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return exc.code, raw
+    except Exception as exc:  # noqa: BLE001
+        return 0, str(exc)
 
-            # 3. 填写密码并登录
-            # Koyeb 现在会在新页面或动态加载密码框
-            page.wait_for_selector('input[name="password"]', timeout=15000)
-            page.fill('input[name="password"]', password)
-            page.click('button[type="submit"]')
-            print(f"[{email}] 第二步：密码已提交")
 
-            # 4. 验证登录结果或处理弹窗
-            try:
-                # 等待直到进入 dashboard 控制台
-                page.wait_for_url("**/dashboard**", timeout=20000)
-                return f"账号 {email} 登录成功!"
-            except:
-                # 检查是否有 "Skip for now" 类的按钮（处理 2FA 提示）
-                skip_btn = page.query_selector('text="Skip for now", text="Maybe later"')
-                if skip_btn:
-                    skip_btn.click()
-                    page.wait_for_timeout(3000)
-                    return f"账号 {email} 登录成功 (已跳过引导弹窗)!"
-                
-                # 如果既没进入 dashboard 也没找到跳过按钮，抛出错误以便截图
-                raise Exception("无法确认登录状态，可能出现了验证码或新的引导页面")
+def check_token(name: str, token: str) -> tuple[bool, str]:
+    status, body = api_get(API_PROFILE, token)
+    if status != 200:
+        detail = body
+        if isinstance(body, dict):
+            detail = body.get("message") or body.get("code") or body
+        return False, f"账号 {name} 保活失败: HTTP {status} - {detail}"
 
-        except Exception as e:
-            # 捕获异常并截图
-            try:
-                page.screenshot(path=screenshot_path, full_page=True)
-                print(f"[{email}] 登录失败，已保存调试截图: {screenshot_path}")
-            except Exception as se:
-                print(f"[{email}] 截图失败: {se}")
-            return f"账号 {email} 登录出错: {str(e)}"
-        finally:
-            browser.close()
+    user = body.get("user") if isinstance(body, dict) else None
+    email = ""
+    user_id = ""
+    if isinstance(user, dict):
+        email = user.get("email") or ""
+        user_id = user.get("id") or ""
+
+    org_status, org_body = api_get(API_ORG, token)
+    org_name = ""
+    org_state = ""
+    if org_status == 200 and isinstance(org_body, dict):
+        org = org_body.get("organization") or {}
+        if isinstance(org, dict):
+            org_name = org.get("name") or ""
+            org_state = org.get("status") or ""
+
+    parts = [f"账号 {name} 保活成功"]
+    if email:
+        parts.append(f"email={email}")
+    if user_id:
+        parts.append(f"id={user_id}")
+    if org_name:
+        parts.append(f"org={org_name}")
+    if org_state:
+        parts.append(f"org_status={org_state}")
+    return True, " | ".join(parts)
+
+
+def parse_tokens(raw: str) -> list[tuple[str, str]]:
+    """解析 `name:token` 列表，空格分隔。也兼容仅 token（自动命名）。"""
+    items: list[tuple[str, str]] = []
+    for idx, part in enumerate(raw.split(), start=1):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            name, token = part.split(":", 1)
+            name = name.strip() or f"account{idx}"
+            token = token.strip()
+        else:
+            name, token = f"account{idx}", part
+        if token:
+            items.append((name, token))
+    return items
+
+
+def main() -> int:
+    # 优先 KOY_TOKENS；兼容误配到 KOY_ACC 的 token 列表
+    tokens_env = os.environ.get("KOY_TOKENS") or os.environ.get("KOY_ACC") or ""
+    if not tokens_env.strip():
+        print("错误：未找到 KOY_TOKENS（或 KOY_ACC）环境变量")
+        print("格式: name1:token1 name2:token2")
+        return 1
+
+    accounts = parse_tokens(tokens_env)
+    if not accounts:
+        print("错误：KOY_TOKENS 解析后为空，请检查格式 name:token")
+        return 1
+
+    results: list[str] = []
+    failed = 0
+
+    for name, token in accounts:
+        ok, msg = check_token(name, token)
+        print(msg)
+        results.append(msg)
+        if not ok:
+            failed += 1
+
+    report = "*Koyeb API 保活任务报告*:\n\n" + "\n".join(results)
+    send_telegram_message(report)
+
+    if failed:
+        print(f"完成：成功 {len(accounts) - failed}/{len(accounts)}，失败 {failed}")
+        return 1
+
+    print(f"完成：全部成功 {len(accounts)}/{len(accounts)}")
+    return 0
+
 
 if __name__ == "__main__":
-    # 从环境变量获取账号信息，格式为 "email1:pass1 email2:pass2"
-    accounts_env = os.environ.get('KOY_ACC', '')
-    if not accounts_env:
-        print("错误：未找到 KOY_ACC 环境变量")
-        exit(1)
-        
-    accounts = accounts_env.split()
-    login_statuses = []
-
-    for account in accounts:
-        if ':' not in account:
-            continue
-        email, password = account.split(':', 1)
-        status = login_koyeb(email, password)
-        login_statuses.append(status)
-        print(status)
-
-    if login_statuses:
-        report = "?? *Koyeb 自动登录任务报告*:\n\n" + "\n".join(login_statuses)
-        send_telegram_message(report)
+    sys.exit(main())
